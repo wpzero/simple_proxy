@@ -1,0 +1,3 @@
+========== THIS IS A SIMPLE TCP PROXY
+
+  basic use like ./proxy -l 4455 -h localhost -p 3344 -f -i "tee input.log" -o "tee out.log"
