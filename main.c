@@ -62,6 +62,7 @@ int create_connection();
 int parse_options(int argc, char *argv[]);
 void plog(int priority, const char *format, ...);
 static void* clientthread(void *data);
+int execcmd(int *writefd, int *readfd, char *cmd);
 int server_sock, remote_port = 0;
 int connections_processed = 0;
 char *bind_addr, *remote_host, *cmd_in, *cmd_out;
@@ -216,10 +217,33 @@ void sigchld_handler(int signal) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
+/* 用于system来执行命令，同时设置pipe_in, pipe_out */
+int execcmd(int *writefd, int *readfd, char *cmd) {
+        int pipe_in[2], pipe_out[2];
+        if(pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
+                return 0;
+        }
+        if(fork() == 0) {
+                dup2(pipe_in[READ], STDIN_FILENO);
+                dup2(pipe_out[WRITE], STDOUT_FILENO);
+                close(pipe_in[WRITE]);
+                close(pipe_out[READ]);
+                int n = system(cmd);
+                exit(n);
+        } else {
+                *writefd = pipe_in[WRITE];
+                *readfd = pipe_out[READ];
+                close(pipe_in[READ]);
+                close(pipe_out[WRITE]);
+        }
+        return 1;
+}
+
+/* thread 函数 */
 static void* clientthread(void *data)
 {
         struct thread *t = data;
-        int maxfd, client_sock, remote_sock, cmdin_pipe_in[2], cmdin_pipe_out[2], cmdout_pipe_in[2], cmdout_pipe_out[2], n;
+        int maxfd, client_sock, remote_sock, cmdin_writefd, cmdin_readfd, cmdout_writefd, cmdout_readfd;
         fd_set fdsc, fds;
 
         if ((remote_sock = create_connection()) < 0) {
@@ -238,41 +262,14 @@ static void* clientthread(void *data)
         FD_SET(remote_sock, &fdsc);
 
         /* 利用pipe来process间通信*/
-        if(cmd_in) {
-                if(pipe(cmdin_pipe_in) < 0 || pipe(cmdin_pipe_out) < 0) {
-                        plog(LOG_CRIT, "Cannot create pipe: %m");
-                        exit(CREATE_PIPE_ERROR);
-                }
-                if(fork() == 0) {
-                        dup2(cmdin_pipe_in[READ], STDIN_FILENO);
-                        dup2(cmdin_pipe_out[WRITE], STDOUT_FILENO);
-                        close(cmdin_pipe_in[WRITE]);
-                        close(cmdin_pipe_out[READ]);
-                        n = system(cmd_in);
-                        exit(n);
-                } else {
-                        close(cmdin_pipe_in[READ]);
-                        close(cmdin_pipe_out[WRITE]);
-                }
-
+        if(cmd_in && 0 == execcmd(&cmdin_writefd, &cmdin_readfd, cmd_in)) {
+                plog(LOG_CRIT, "Cannot create pipe: %m");
+                exit(CREATE_PIPE_ERROR);
         }
 
-        if(cmd_out) {
-                if(pipe(cmdout_pipe_in) < 0 || pipe(cmdout_pipe_out) < 0) {
-                        plog(LOG_CRIT, "Cannot create pipe: %m");
-                        exit(CREATE_PIPE_ERROR);
-                }
-                if(fork() == 0) {
-                        dup2(cmdout_pipe_in[READ], STDIN_FILENO);
-                        dup2(cmdout_pipe_out[WRITE], STDOUT_FILENO);
-                        close(cmdout_pipe_in[WRITE]);
-                        close(cmdout_pipe_out[READ]);
-                        n = system(cmd_out);
-                        exit(n);
-                } else {
-                        close(cmdout_pipe_in[READ]);
-                        close(cmdout_pipe_out[WRITE]);
-                }
+        if(cmd_out && 0 == execcmd(&cmdout_writefd, &cmdout_readfd, cmd_out)) {
+                plog(LOG_CRIT, "Cannot create pipe: %m");
+                exit(CREATE_PIPE_ERROR);
         }
 
         while(1) {
@@ -301,8 +298,8 @@ static void* clientthread(void *data)
                         outfd = remote_sock;
                         if(cmd_out) {
                                 cmd = cmd_out;
-                                pipe_in = cmdout_pipe_in[WRITE];
-                                pipe_out = cmdout_pipe_out[READ];
+                                pipe_in = cmdout_writefd;
+                                pipe_out = cmdout_readfd;
                         }
 
                 } else {
@@ -310,8 +307,8 @@ static void* clientthread(void *data)
                         infd = remote_sock;
                         if(cmd_in) {
                                 cmd = cmd_in;
-                                pipe_in = cmdin_pipe_in[WRITE];
-                                pipe_out = cmdin_pipe_out[READ];
+                                pipe_in = cmdin_writefd;
+                                pipe_out = cmdin_readfd;
                         }
                 }
 
