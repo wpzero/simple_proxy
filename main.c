@@ -272,6 +272,9 @@ void handle_client2(int client_sock)
                 int outfd = infd == client_sock ? remote_sock : client_sock;
                 char buf[BUF_SIZE];
                 ssize_t sent = 0, n = read(infd, buf, sizeof buf);
+                if(n <= 0) {
+                        goto cleanup;
+                }
                 while(sent < n) {
                         ssize_t m = write(outfd, buf+sent, n-sent);
                         if(m < 0) return;
