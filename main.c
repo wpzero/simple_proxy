@@ -62,6 +62,7 @@ int create_connection();
 int parse_options(int argc, char *argv[]);
 void plog(int priority, const char *format, ...);
 static void* clientthread(void *data);
+int execcmd(int *writefd, int *readfd, char *cmd);
 int server_sock, remote_port = 0;
 int connections_processed = 0;
 char *bind_addr, *remote_host, *cmd_in, *cmd_out;
@@ -216,10 +217,33 @@ void sigchld_handler(int signal) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
+/* 用于system来执行命令，同时设置pipe_in, pipe_out */
+int execcmd(int *writefd, int *readfd, char *cmd) {
+        int pipe_in[2], pipe_out[2];
+        if(pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
+                return 0;
+        }
+        if(fork() == 0) {
+                dup2(pipe_in[READ], STDIN_FILENO);
+                dup2(pipe_out[WRITE], STDOUT_FILENO);
+                close(pipe_in[WRITE]);
+                close(pipe_out[READ]);
+                int n = system(cmd);
+                exit(n);
+        } else {
+                *writefd = pipe_in[WRITE];
+                *readfd = pipe_out[READ];
+                close(pipe_in[READ]);
+                close(pipe_out[WRITE]);
+        }
+        return 1;
+}
+
+/* thread 函数 */
 static void* clientthread(void *data)
 {
         struct thread *t = data;
-        int maxfd, client_sock, remote_sock;
+        int maxfd, client_sock, remote_sock, cmdin_writefd, cmdin_readfd, cmdout_writefd, cmdout_readfd;
         fd_set fdsc, fds;
 
         if ((remote_sock = create_connection()) < 0) {
@@ -236,6 +260,17 @@ static void* clientthread(void *data)
         FD_ZERO(&fdsc);
         FD_SET(client_sock, &fdsc);
         FD_SET(remote_sock, &fdsc);
+
+        /* 利用pipe来process间通信*/
+        if(cmd_in && 0 == execcmd(&cmdin_writefd, &cmdin_readfd, cmd_in)) {
+                plog(LOG_CRIT, "Cannot create pipe: %m");
+                exit(CREATE_PIPE_ERROR);
+        }
+
+        if(cmd_out && 0 == execcmd(&cmdout_writefd, &cmdout_readfd, cmd_out)) {
+                plog(LOG_CRIT, "Cannot create pipe: %m");
+                exit(CREATE_PIPE_ERROR);
+        }
 
         while(1) {
                 /* 每一次初始化一下 fds, 因为select会修改这个值 */
@@ -255,8 +290,28 @@ static void* clientthread(void *data)
                         goto cleanup;
                 }
 
-                int infd = FD_ISSET(client_sock, &fds) ? client_sock : remote_sock;
-                int outfd = infd == client_sock ? remote_sock : client_sock;
+                int infd, outfd, pipe_in, pipe_out;
+                char *cmd = NULL;
+
+                if(FD_ISSET(client_sock, &fds)) {
+                        infd = client_sock;
+                        outfd = remote_sock;
+                        if(cmd_out) {
+                                cmd = cmd_out;
+                                pipe_in = cmdout_writefd;
+                                pipe_out = cmdout_readfd;
+                        }
+
+                } else {
+                        outfd = client_sock;
+                        infd = remote_sock;
+                        if(cmd_in) {
+                                cmd = cmd_in;
+                                pipe_in = cmdin_writefd;
+                                pipe_out = cmdin_readfd;
+                        }
+                }
+
                 char buf[BUF_SIZE];
                 ssize_t sent = 0, n = read(infd, buf, sizeof buf);
                 /*　有一个socket断掉了 */
@@ -264,6 +319,17 @@ static void* clientthread(void *data)
                 if(n <= 0) {
                         goto cleanup;
                 }
+
+                if(cmd) {
+                        while(sent < n) {
+                                ssize_t m = write(pipe_in, buf+sent, n-sent);
+                                if(m < 0) goto cleanup;
+                                sent += m;
+                        }
+
+                        sent = 0, n = read(pipe_out, buf, sizeof buf);
+                }
+
                 while(sent < n) {
                         ssize_t m = write(outfd, buf+sent, n-sent);
                         if(m < 0) goto cleanup;
