@@ -12,7 +12,7 @@ all: $(PROG)
 -include $(DEPENDS)
 
 $(PROG): $(OBJS)
-	$(CC) $(LDFLAGS) $(LIBS) -o $(PROG) $(OBJS)
+	$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $(PROG)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

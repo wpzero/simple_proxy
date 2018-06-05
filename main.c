@@ -14,6 +14,8 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <pthread.h>
+#include "sblist.h"
 #ifdef USE_SYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
@@ -34,21 +36,33 @@
 #define BROKEN_PIPE_ERROR -9
 #define SYNTAX_ERROR -10
 
+union sockaddr_union {
+        struct sockaddr_in  v4;
+        struct sockaddr_in6 v6;
+};
+
+struct client {
+        union sockaddr_union addr;
+        int fd;
+};
+
+struct thread {
+        pthread_t pt;
+        struct client client;
+        int remote_sock;
+        volatile int done;
+};
+
 typedef enum {TRUE = 1, FALSE = 0} bool;
 
 int create_socket(int port);
 void sigchld_handler(int signal);
-void sigterm_handler(int signal);
 void server_loop();
-void handle_client(int client_sock, struct sockaddr_in client_addr);
-void handle_client2(int client_sock);
-void forward_data(int source_sock, int destination_sock);
-void forward_data_ext(int source_sock, int destination_sock, char *cmd);
 int create_connection();
 int parse_options(int argc, char *argv[]);
 void plog(int priority, const char *format, ...);
-
-int server_sock, client_sock, remote_sock, remote_port = 0;
+static void* clientthread(void *data);
+int server_sock, remote_port = 0;
 int connections_processed = 0;
 char *bind_addr, *remote_host, *cmd_in, *cmd_out;
 bool foreground = FALSE;
@@ -75,8 +89,7 @@ int main(int argc, char *argv[]) {
                 return server_sock;
         }
 
-        signal(SIGCHLD, sigchld_handler); // prevent ended children from becoming zombies
-        signal(SIGTERM, sigterm_handler); // handle KILL signal
+        signal(SIGCHLD, sigchld_handler);
 
         if (foreground) {
                 server_loop();
@@ -203,46 +216,20 @@ void sigchld_handler(int signal) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
-/* term CTRL+C signal */
-void sigterm_handler(int signal) {
-        close(client_sock);
-        close(server_sock);
-        exit(0);
-}
-
-/* Main server loop */
-void server_loop() {
-        struct sockaddr_in client_addr;
-        socklen_t addrlen = sizeof(client_addr);
-
-#ifdef USE_SYSTEMD
-        sd_notify(0, "READY=1\n");
-#endif
-
-        while (TRUE) {
-                update_connection_count();
-                client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addrlen);
-                if (fork() == 0) { // handle client connection in a separate process
-                        close(server_sock);
-                        handle_client2(client_sock);
-                        /* handle_client(client_sock, client_addr); */
-                        exit(0);
-                } else
-                        connections_processed++;
-                close(client_sock);
-        }
-
-}
-
-void handle_client2(int client_sock)
+static void* clientthread(void *data)
 {
-        int maxfd;
+        struct thread *t = data;
+        int maxfd, client_sock, remote_sock;
         fd_set fdsc, fds;
 
         if ((remote_sock = create_connection()) < 0) {
                 plog(LOG_ERR, "Cannot connect to host: %m");
                 goto cleanup;
         }
+
+        t->remote_sock = remote_sock;
+        client_sock = t->client.fd;
+
         maxfd = client_sock > remote_sock ? client_sock : remote_sock;
 
         /* fdsc 用于保存需要监视的文件 */
@@ -254,7 +241,7 @@ void handle_client2(int client_sock)
                 /* 每一次初始化一下 fds, 因为select会修改这个值 */
                 memcpy(&fds, &fdsc, sizeof(fds));
 
-                struct timeval timeout = {.tv_sec = 60*15, .tv_usec = 0};
+                struct timeval timeout = {.tv_sec = 60*3, .tv_usec = 0};
                 switch (select(maxfd+1, &fds, 0, 0, &timeout)) {
                 case 0: {
                         goto cleanup;
@@ -272,133 +259,86 @@ void handle_client2(int client_sock)
                 int outfd = infd == client_sock ? remote_sock : client_sock;
                 char buf[BUF_SIZE];
                 ssize_t sent = 0, n = read(infd, buf, sizeof buf);
+                /*　有一个socket断掉了 */
+                /* 这个很重要，如果read 0 说明对方链接关掉了 */
+                if(n <= 0) {
+                        goto cleanup;
+                }
                 while(sent < n) {
                         ssize_t m = write(outfd, buf+sent, n-sent);
-                        if(m < 0) return;
+                        if(m < 0) goto cleanup;
                         sent += m;
                 }
         }
 cleanup:
-        close(remote_sock);
-        close(client_sock);
+        if(remote_sock > 0)
+                close(remote_sock);
+        if(client_sock > 0)
+                close(client_sock);
+        t->done = 1;
+        return 0;
 }
 
-/* Handle client connection */
-void handle_client(int client_sock, struct sockaddr_in client_addr)
-{
-        if ((remote_sock = create_connection()) < 0) {
-                plog(LOG_ERR, "Cannot connect to host: %m");
-                goto cleanup;
+static void collect(sblist *threads) {
+        size_t i;
+        for(i=0;i<sblist_getsize(threads);) {
+                struct thread* thread = *((struct thread**)sblist_get(threads, i));
+                if(thread->done) {
+                        pthread_join(thread->pt, 0);
+                        sblist_delete(threads, i);
+                        free(thread);
+                } else
+                        i++;
         }
-
-        /* a process forwarding data from client to remote socket */
-        if (fork() == 0) {
-                if (cmd_out) {
-                        forward_data_ext(client_sock, remote_sock, cmd_out);
-                } else {
-                        forward_data(client_sock, remote_sock);
-                }
-                exit(0);
-        }
-
-        /* a process forwarding from remote host to client socket */
-        if (fork() == 0) {
-                if (cmd_in) {
-                        forward_data_ext(remote_sock, client_sock, cmd_in);
-                } else {
-                        forward_data(remote_sock, client_sock);
-                }
-                exit(0);
-        }
-
-cleanup:
-        close(remote_sock);
-        close(client_sock);
 }
 
-/* Forward data between sockets */
-void forward_data(int source_sock, int destination_sock) {
-        ssize_t n;
+/* 监听和accept循环 */
+void server_loop() {
+        int client_sock;
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+        sblist *threads = sblist_new(sizeof (struct thread*), 8);
 
-#ifdef USE_SPLICE
-        int buf_pipe[2];
-
-        if (pipe(buf_pipe) == -1) {
-                plog(LOG_ERR, "pipe: %m");
-                exit(CREATE_PIPE_ERROR);
-        }
-
-        while ((n = splice(source_sock, NULL, buf_pipe[WRITE], NULL, SSIZE_MAX, SPLICE_F_NONBLOCK|SPLICE_F_MOVE)) > 0) {
-                if (splice(buf_pipe[READ], NULL, destination_sock, NULL, SSIZE_MAX, SPLICE_F_MOVE) < 0) {
-                        plog(LOG_ERR, "write: %m");
-                        exit(BROKEN_PIPE_ERROR);
-                }
-        }
-#else
-        char buffer[BUF_SIZE];
-
-        while ((n = recv(source_sock, buffer, BUF_SIZE, 0)) > 0) { // read data from input socket
-                send(destination_sock, buffer, n, 0); // send data to output socket
-        }
+#ifdef USE_SYSTEMD
+        sd_notify(0, "READY=1\n");
 #endif
+        size_t stacksz = 512 * 1024;
 
-        if (n < 0) {
-                plog(LOG_ERR, "read: %m");
-                exit(BROKEN_PIPE_ERROR);
-        }
-
-#ifdef USE_SPLICE
-        close(buf_pipe[0]);
-        close(buf_pipe[1]);
-#endif
-
-        shutdown(destination_sock, SHUT_RDWR); // stop other processes from using socket
-        close(destination_sock);
-
-        shutdown(source_sock, SHUT_RDWR); // stop other processes from using socket
-        close(source_sock);
-}
-
-/* Forward data between sockets through external command */
-void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
-        char buffer[BUF_SIZE];
-        int n, i, pipe_in[2], pipe_out[2];
-
-        if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) { // create command input and output pipes
-                plog(LOG_CRIT, "Cannot create pipe: %m");
-                exit(CREATE_PIPE_ERROR);
-        }
-
-        if (fork() == 0) {
-                dup2(pipe_in[READ], STDIN_FILENO); // replace standard input with input part of pipe_in
-                dup2(pipe_out[WRITE], STDOUT_FILENO); // replace standard output with output part of pipe_out
-                close(pipe_in[WRITE]); // close unused end of pipe_in
-                close(pipe_out[READ]); // close unused end of pipe_out
-                n = system(cmd); // execute command
-                exit(n);
-        } else {
-                close(pipe_in[READ]); // no need to read from input pipe here
-                close(pipe_out[WRITE]); // no need to write to output pipe here
-
-                while ((n = recv(source_sock, buffer, BUF_SIZE, 0)) > 0) { // read data from input socket
-                        if (write(pipe_in[WRITE], buffer, n) < 0) { // write data to input pipe of external command
-                                plog(LOG_ERR, "Cannot write to pipe: %m");
-                                exit(BROKEN_PIPE_ERROR);
-                        }
-                        if ((i = read(pipe_out[READ], buffer, BUF_SIZE)) > 0) { // read command output
-                                send(destination_sock, buffer, i, 0); // send data to output socket
-                        }
+        while(TRUE) {
+                collect(threads);
+                struct thread *curr = malloc(sizeof (struct thread));
+                if(!curr) goto oom;
+                curr->done = 0;
+                client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addrlen);
+                if(client_sock < 0) {
+                        free(curr);
+                        plog(LOG_ERR, "connect %m\n");
+                        continue;
                 }
 
-                shutdown(destination_sock, SHUT_RDWR); // stop other processes from using socket
-                close(destination_sock);
+                curr->client.fd = client_sock;
+                curr->client.addr.v4 = client_addr;
+                if(!sblist_add(threads, &curr)) {
+                        close(curr->client.fd);
+                        free(curr);
+                        oom:
+                        plog(LOG_ERR, "rejecting connection due to OOM\n");
+                        usleep(16); /* prevent 100% CPU usage in OOM situation */
+                        continue;
+                }
 
-                shutdown(source_sock, SHUT_RDWR); // stop other processes from using socket
-                close(source_sock);
+                pthread_attr_t *a = 0, attr;
+                if(pthread_attr_init(&attr) == 0) {
+                        a = &attr;
+                        pthread_attr_setstacksize(a, stacksz);
+                }
+                if(pthread_create(&curr->pt, a, clientthread, curr) != 0)
+                        plog(LOG_ERR, "pthread_create failed. OOM?\n");
+                if(a) pthread_attr_destroy(&attr);
         }
 }
 
-/* Create client connection */
+/* 创建一个链接到remote的socket */
 int create_connection() {
         struct sockaddr_in server_addr;
         struct hostent *server;
