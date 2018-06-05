@@ -219,7 +219,7 @@ void sigchld_handler(int signal) {
 static void* clientthread(void *data)
 {
         struct thread *t = data;
-        int maxfd, client_sock, remote_sock;
+        int maxfd, client_sock, remote_sock, cmdin_pipe_in[2], cmdin_pipe_out[2], cmdout_pipe_in[2], cmdout_pipe_out[2], n;
         fd_set fdsc, fds;
 
         if ((remote_sock = create_connection()) < 0) {
@@ -236,6 +236,44 @@ static void* clientthread(void *data)
         FD_ZERO(&fdsc);
         FD_SET(client_sock, &fdsc);
         FD_SET(remote_sock, &fdsc);
+
+        /* 利用pipe来process间通信*/
+        if(cmd_in) {
+                if(pipe(cmdin_pipe_in) < 0 || pipe(cmdin_pipe_out) < 0) {
+                        plog(LOG_CRIT, "Cannot create pipe: %m");
+                        exit(CREATE_PIPE_ERROR);
+                }
+                if(fork() == 0) {
+                        dup2(cmdin_pipe_in[READ], STDIN_FILENO);
+                        dup2(cmdin_pipe_out[WRITE], STDOUT_FILENO);
+                        close(cmdin_pipe_in[WRITE]);
+                        close(cmdin_pipe_out[READ]);
+                        n = system(cmd_in);
+                        exit(n);
+                } else {
+                        close(cmdin_pipe_in[READ]);
+                        close(cmdin_pipe_out[WRITE]);
+                }
+
+        }
+
+        if(cmd_out) {
+                if(pipe(cmdout_pipe_in) < 0 || pipe(cmdout_pipe_out) < 0) {
+                        plog(LOG_CRIT, "Cannot create pipe: %m");
+                        exit(CREATE_PIPE_ERROR);
+                }
+                if(fork() == 0) {
+                        dup2(cmdout_pipe_in[READ], STDIN_FILENO);
+                        dup2(cmdout_pipe_out[WRITE], STDOUT_FILENO);
+                        close(cmdout_pipe_in[WRITE]);
+                        close(cmdout_pipe_out[READ]);
+                        n = system(cmd_out);
+                        exit(n);
+                } else {
+                        close(cmdout_pipe_in[READ]);
+                        close(cmdout_pipe_out[WRITE]);
+                }
+        }
 
         while(1) {
                 /* 每一次初始化一下 fds, 因为select会修改这个值 */
@@ -255,8 +293,28 @@ static void* clientthread(void *data)
                         goto cleanup;
                 }
 
-                int infd = FD_ISSET(client_sock, &fds) ? client_sock : remote_sock;
-                int outfd = infd == client_sock ? remote_sock : client_sock;
+                int infd, outfd, pipe_in, pipe_out;
+                char *cmd = NULL;
+
+                if(FD_ISSET(client_sock, &fds)) {
+                        infd = client_sock;
+                        outfd = remote_sock;
+                        if(cmd_out) {
+                                cmd = cmd_out;
+                                pipe_in = cmdout_pipe_in[WRITE];
+                                pipe_out = cmdout_pipe_out[READ];
+                        }
+
+                } else {
+                        outfd = client_sock;
+                        infd = remote_sock;
+                        if(cmd_in) {
+                                cmd = cmd_in;
+                                pipe_in = cmdin_pipe_in[WRITE];
+                                pipe_out = cmdin_pipe_out[READ];
+                        }
+                }
+
                 char buf[BUF_SIZE];
                 ssize_t sent = 0, n = read(infd, buf, sizeof buf);
                 /*　有一个socket断掉了 */
@@ -264,6 +322,17 @@ static void* clientthread(void *data)
                 if(n <= 0) {
                         goto cleanup;
                 }
+
+                if(cmd) {
+                        while(sent < n) {
+                                ssize_t m = write(pipe_in, buf+sent, n-sent);
+                                if(m < 0) goto cleanup;
+                                sent += m;
+                        }
+
+                        sent = 0, n = read(pipe_out, buf, sizeof buf);
+                }
+
                 while(sent < n) {
                         ssize_t m = write(outfd, buf+sent, n-sent);
                         if(m < 0) goto cleanup;
