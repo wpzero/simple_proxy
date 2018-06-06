@@ -243,8 +243,15 @@ int execcmd(int *writefd, int *readfd, char *cmd) {
 static void* clientthread(void *data)
 {
         struct thread *t = data;
-        int maxfd, client_sock, remote_sock, cmdin_writefd, cmdin_readfd, cmdout_writefd, cmdout_readfd;
+        int maxfd, client_sock, remote_sock, cmdin_writefd, cmdin_readfd, cmdout_writefd, cmdout_readfd, r;
         fd_set fdsc, fds;
+        sigset_t set;
+
+        sigemptyset(&set);
+        sigaddset(&set, SIGCHLD);
+        r = pthread_sigmask(SIG_BLOCK, &set, NULL);
+        if(r != 0)
+                plog(LOG_ERR, "Thread can not set sigmask: %m");
 
         if ((remote_sock = create_connection()) < 0) {
                 plog(LOG_ERR, "Cannot connect to host: %m");
@@ -278,6 +285,7 @@ static void* clientthread(void *data)
 
                 struct timeval timeout = {.tv_sec = 60*3, .tv_usec = 0};
                 switch (select(maxfd+1, &fds, 0, 0, &timeout)) {
+                /* 这个是timeout */
                 case 0: {
                         goto cleanup;
                         break;
