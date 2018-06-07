@@ -58,6 +58,8 @@ typedef enum {TRUE = 1, FALSE = 0} bool;
 int create_socket(int port);
 void sigchld_handler(int signal);
 void server_loop();
+int resolve(const char *host, unsigned short port, struct addrinfo** addr);
+int create_target_connection();
 int create_connection();
 int parse_options(int argc, char *argv[]);
 void plog(int priority, const char *format, ...);
@@ -253,7 +255,7 @@ static void* clientthread(void *data)
         if(r != 0)
                 plog(LOG_ERR, "Thread can not set sigmask: %m");
 
-        if ((remote_sock = create_connection()) < 0) {
+        if ((remote_sock = create_target_connection()) < 0) {
                 plog(LOG_ERR, "Cannot connect to host: %m");
                 goto cleanup;
         }
@@ -412,7 +414,39 @@ void server_loop() {
         }
 }
 
+int resolve(const char *host, unsigned short port, struct addrinfo** addr) {
+        struct addrinfo hints = {
+                .ai_family = AF_UNSPEC,
+                .ai_socktype = SOCK_STREAM,
+                .ai_flags = AI_PASSIVE,
+        };
+        char port_buf[8];
+        snprintf(port_buf, sizeof port_buf, "%u", port);
+        return getaddrinfo(host, port_buf, &hints, addr);
+}
+
+int create_target_connection() {
+        struct addrinfo *ainfo, *p;
+        int sock;
+        if(resolve(remote_host, remote_port, &ainfo)) return -1;
+        for(p = ainfo; p; p = p->ai_next) {
+                if((sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
+                        continue;
+                if(connect(sock, p->ai_addr, p->ai_addrlen) < 0) {
+                        close(sock);
+                        sock = -1;
+                        continue;
+                }
+                break;
+        }
+        if(sock < 0)
+                return CLIENT_RESOLVE_ERROR;
+        return sock;
+}
+
 /* 创建一个链接到remote的socket */
+/* 这个应该不是线程安全的 */
+/* gethostbyname is not reentrant 不是线程安全的 */
 int create_connection() {
         struct sockaddr_in server_addr;
         struct hostent *server;
